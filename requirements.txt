@@ -1,0 +1,3 @@
+pip install pyrogram python-dotenv tgcrypto
+# Also need megatools installed:
+sudo apt install megatools
