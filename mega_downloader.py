@@ -6,6 +6,7 @@ import time
 import shutil
 import logging
 import mimetypes
+import signal
 from logging.handlers import RotatingFileHandler
 from aiohttp import web
 from pyrogram import Client, filters
@@ -429,18 +430,21 @@ async def user_worker(client: Client, user_id: int):
 #  HEALTH CHECK SERVER  (Koyeb ke liye)
 # ══════════════════════════════════════════════════════════════════════════════
 
+_health_runner = None
+
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
 async def start_health_server():
+    global _health_runner
     web_app = web.Application()
     web_app.router.add_get("/", health_handler)
     web_app.router.add_get("/health", health_handler)
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    _health_runner = web.AppRunner(web_app)
+    await _health_runner.setup()
+    site = web.TCPSite(_health_runner, "0.0.0.0", HEALTH_PORT)
     await site.start()
-    logger.info(f"[HEALTH] Server running on port {HEALTH_PORT}")
+    logger.info(f"[HEALTH] Server listening on 0.0.0.0:{HEALTH_PORT}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HANDLERS
@@ -521,10 +525,11 @@ async def cmd_status(client: Client, message: Message):
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main():
-    # Start health check server
+    # 1. Health server FIRST — Koyeb checks it immediately on startup
     await start_health_server()
+    logger.info(f"[HEALTH] Ready on port {HEALTH_PORT}")
 
-    # Log startup info
+    # 2. Startup info
     if MEGA_ACCOUNTS:
         logger.info(f"[STARTUP] {len(MEGA_ACCOUNTS)} MEGA account(s) loaded:")
         for i, acc in enumerate(MEGA_ACCOUNTS, 1):
@@ -533,10 +538,32 @@ async def main():
     else:
         logger.info("[STARTUP] No MEGA accounts — anonymous mode")
 
-    logger.info("[STARTUP] Bot starting...")
+    # 3. Start Pyrogram bot
+    logger.info("[STARTUP] Connecting to Telegram...")
     await app.start()
     logger.info("[STARTUP] Bot online ✅")
-    await asyncio.get_event_loop().create_future()  # run forever
+
+    # 4. Keep alive — handle signals gracefully
+    stop_event = asyncio.Event()
+
+    def _handle_signal():
+        logger.info("[SHUTDOWN] Signal received")
+        stop_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _handle_signal)
+        except NotImplementedError:
+            pass  # Windows
+
+    await stop_event.wait()
+
+    logger.info("[SHUTDOWN] Stopping bot...")
+    await app.stop()
+    if _health_runner:
+        await _health_runner.cleanup()
+    logger.info("[SHUTDOWN] Done.")
 
 if __name__ == "__main__":
     asyncio.run(main())
