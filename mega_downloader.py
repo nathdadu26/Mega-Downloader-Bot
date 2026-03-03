@@ -41,7 +41,7 @@ API_ID          = int(os.getenv("API_ID"))
 API_HASH        = os.getenv("API_HASH")
 BOT_TOKEN       = os.getenv("BOT_TOKEN")
 STORAGE_CHANNEL = int(os.getenv("STORAGE_CHANNEL"))
-HEALTH_PORT     = int(os.getenv("PORT", "8080"))
+HEALTH_PORT     = int(os.getenv("PORT", "8000"))
 
 MAX_SIZE_BYTES   = 4 * 1024 * 1024 * 1024   # 4 GB
 QUOTA_RETRY_SECS = 6 * 60 * 60              # 6 hours
