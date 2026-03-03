@@ -10,7 +10,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY mega_bot.py .
+COPY mega_downloader.py .
 
 # Koyeb health check port
 EXPOSE 8080
