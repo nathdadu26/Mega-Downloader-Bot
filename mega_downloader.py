@@ -6,7 +6,6 @@ import time
 import shutil
 import logging
 import mimetypes
-import signal
 from logging.handlers import RotatingFileHandler
 from pyrogram import Client, filters
 from pyrogram.types import Message
@@ -526,8 +525,8 @@ async def cmd_status(client: Client, message: Message):
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def main():
-    # 1. Health server FIRST — Koyeb checks it immediately on startup
+if __name__ == "__main__":
+    # 1. Health server FIRST (runs in background thread)
     start_health_server()
     logger.info(f"[HEALTH] Ready on port {HEALTH_PORT}")
 
@@ -540,33 +539,7 @@ async def main():
     else:
         logger.info("[STARTUP] No MEGA accounts — anonymous mode")
 
-    # 3. Start Pyrogram bot
+    # 3. Run bot (Pyrogram manages its own event loop)
     logger.info("[STARTUP] Connecting to Telegram...")
-    await app.start()
     logger.info("[STARTUP] Bot online ✅")
-
-    # 4. Keep alive — handle signals gracefully
-    stop_event = asyncio.Event()
-
-    def _handle_signal():
-        logger.info("[SHUTDOWN] Signal received")
-        stop_event.set()
-
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, _handle_signal)
-        except NotImplementedError:
-            pass  # Windows
-
-    await stop_event.wait()
-
-    logger.info("[SHUTDOWN] Stopping bot...")
-    try:
-        await app.stop()
-    except Exception as e:
-        logger.warning(f"[SHUTDOWN] Stop error (ignored): {e}")
-    logger.info("[SHUTDOWN] Done.")
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    app.run()
