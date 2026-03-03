@@ -8,7 +8,6 @@ import logging
 import mimetypes
 import signal
 from logging.handlers import RotatingFileHandler
-from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from dotenv import load_dotenv
@@ -427,23 +426,26 @@ async def user_worker(client: Client, user_id: int):
             queue.task_done()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  HEALTH CHECK SERVER  (Koyeb ke liye)
+#  HEALTH CHECK SERVER  (Koyeb ke liye — plain threading, no deps)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_health_runner = None
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
-async def health_handler(request):
-    return web.Response(text="OK", status=200)
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
 
-async def start_health_server():
-    global _health_runner
-    web_app = web.Application()
-    web_app.router.add_get("/", health_handler)
-    web_app.router.add_get("/health", health_handler)
-    _health_runner = web.AppRunner(web_app)
-    await _health_runner.setup()
-    site = web.TCPSite(_health_runner, "0.0.0.0", HEALTH_PORT)
-    await site.start()
+    def log_message(self, format, *args):
+        pass  # suppress access logs
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", HEALTH_PORT), _HealthHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
     logger.info(f"[HEALTH] Server listening on 0.0.0.0:{HEALTH_PORT}")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -526,7 +528,7 @@ async def cmd_status(client: Client, message: Message):
 
 async def main():
     # 1. Health server FIRST — Koyeb checks it immediately on startup
-    await start_health_server()
+    start_health_server()
     logger.info(f"[HEALTH] Ready on port {HEALTH_PORT}")
 
     # 2. Startup info
@@ -560,9 +562,10 @@ async def main():
     await stop_event.wait()
 
     logger.info("[SHUTDOWN] Stopping bot...")
-    await app.stop()
-    if _health_runner:
-        await _health_runner.cleanup()
+    try:
+        await app.stop()
+    except Exception as e:
+        logger.warning(f"[SHUTDOWN] Stop error (ignored): {e}")
     logger.info("[SHUTDOWN] Done.")
 
 if __name__ == "__main__":
