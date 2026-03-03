@@ -23,11 +23,9 @@ PREFIX           = "[TG - @Mid_Night_Hub]"
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".ts", ".3gp"}
 MEGA_LINK_RE     = re.compile(r'https?://mega\.nz/(?:file|folder)/[A-Za-z0-9_\-]+#[A-Za-z0-9_\-]+')
 
-# ── Per-user queue system ─────────────────────────────────────────────────────
-# user_id -> asyncio.Queue of (url, message)
-user_queues: dict[int, asyncio.Queue] = {}
-# user_id -> True if worker is running
-user_workers: dict[int, bool] = {}
+# Per-user queue: user_id -> asyncio.Queue of (url, message, status_msg)
+user_queues:  dict[int, asyncio.Queue] = {}
+user_workers: dict[int, bool]          = {}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -72,6 +70,10 @@ def get_all_files(folder: str) -> list:
     return result
 
 
+def is_folder_link(url: str) -> bool:
+    return "/folder/" in url
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MEGA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -83,6 +85,40 @@ class QuotaExceededError(Exception):
 def download_mega(url: str, dest_folder: str):
     result = subprocess.run(
         ["megatools", "dl", url, "--path", dest_folder],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        err = result.stderr + result.stdout
+        if any(k in err.lower() for k in ["quota", "exceeded", "overquota", "509"]):
+            raise QuotaExceededError(err)
+        raise subprocess.CalledProcessError(result.returncode, "megatools", err)
+
+
+def megals_list_files(url: str) -> list:
+    """
+    Returns list of full remote paths for files in a MEGA folder.
+    e.g. ['/Root/FolderName/file1.mp4', '/Root/FolderName/file2.mp4']
+    Returns [] if megals fails.
+    """
+    try:
+        result = subprocess.run(
+            ["megals", "--reload", url],
+            capture_output=True, text=True, timeout=60
+        )
+        files = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line and os.path.splitext(line)[1]:  # has extension = file not dir
+                files.append(line)
+        return sorted(files)
+    except Exception:
+        return []
+
+
+def download_mega_path(remote_path: str, dest_folder: str):
+    """Download a single file from MEGA using its remote path."""
+    result = subprocess.run(
+        ["megatools", "dl", "--path", dest_folder, remote_path],
         capture_output=True, text=True
     )
     if result.returncode != 0:
@@ -152,8 +188,7 @@ async def upload_file(
             status_msg,
             f"⏭️ **Skipping — File {file_index}/{total_files}**\n"
             f"📄 `{actual_name}`\n"
-            f"❌ Not a video file (`{actual_ext or 'unknown'}`)\n"
-            f"✅ Supported: mp4, mkv, avi, mov, flv, wmv, webm, m4v, ts, 3gp"
+            f"❌ Not a video file (`{actual_ext or 'unknown'}`)"
         )
         return False
 
@@ -180,9 +215,9 @@ async def upload_file(
         f"📤 **Uploading — File {file_index}/{total_files}**\n"
         f"📄 `{new_name}`\n\n`Initializing...`"
     )
-    upload_start = time.time()
+    upload_start  = time.time()
+    last_up_edit  = [0.0]
 
-    last_up_edit = [0.0]
     async def up_progress(current, total):
         now = time.time()
         if now - last_up_edit[0] < 3:
@@ -225,7 +260,6 @@ async def upload_file(
         )
         return False
     finally:
-        # cleanup renamed file regardless
         try:
             if os.path.exists(new_path):
                 os.remove(new_path)
@@ -234,7 +268,7 @@ async def upload_file(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PROCESS ONE MEGA LINK
+#  PROCESS ONE MEGA LINK  (file or folder)
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def process_one_link(
@@ -243,14 +277,29 @@ async def process_one_link(
     url: str,
     status_msg: Message,
 ) -> bool:
+
+    is_folder = is_folder_link(url)
+
+    # ── Show what we're working with ─────────────────────────────────────────
+    if is_folder:
+        await safe_edit(
+            status_msg,
+            f"📂 **Folder link detected**\n🔗 `{url}`\n\n🔍 Counting files..."
+        )
+        file_count = megals_count(url)
+        count_str  = f"{file_count} file{'s' if file_count != 1 else ''}" if file_count else "unknown files"
+        dl_header  = f"📂 **Downloading Folder** ({count_str})\n🔗 `{url}`"
+    else:
+        dl_header  = f"📥 **Downloading...**\n🔗 `{url}`"
+
+    # ── Download ──────────────────────────────────────────────────────────────
     dest = f"downloads/{message.chat.id}_{int(time.time())}"
     os.makedirs(dest, exist_ok=True)
 
-    header = f"📥 **Downloading...**\n🔗 `{url}`"
-    await safe_edit(status_msg, f"{header}\n\n`Initializing...`")
+    await safe_edit(status_msg, f"{dl_header}\n\n`Initializing...`")
 
     loop      = asyncio.get_event_loop()
-    prog_task = asyncio.create_task(track_download(dest, status_msg, header))
+    prog_task = asyncio.create_task(track_download(dest, status_msg, dl_header))
 
     try:
         await loop.run_in_executor(None, download_mega, url, dest)
@@ -269,7 +318,7 @@ async def process_one_link(
     finally:
         prog_task.cancel()
 
-    # find all downloaded files
+    # ── Find downloaded files ─────────────────────────────────────────────────
     all_files = get_all_files(dest)
     if not all_files:
         shutil.rmtree(dest, ignore_errors=True)
@@ -277,10 +326,19 @@ async def process_one_link(
         return False
 
     total_files = len(all_files)
-    success     = 0
 
+    if is_folder:
+        await safe_edit(
+            status_msg,
+            f"📂 **Folder downloaded**\n"
+            f"📦 {total_files} file{'s' if total_files > 1 else ''} found\n"
+            f"⏳ Uploading one by one..."
+        )
+        await asyncio.sleep(1)
+
+    # ── Upload each file sequentially ─────────────────────────────────────────
+    success = 0
     for idx in range(1, total_files + 1):
-        # Refresh list each time to avoid stale paths after rename
         current_files = get_all_files(dest)
         if not current_files:
             break
@@ -289,7 +347,8 @@ async def process_one_link(
 
         await safe_edit(
             status_msg,
-            f"⏳ **Processing File {idx}/{total_files}**\n📄 `{fname}`"
+            f"⏳ **{'📂 Folder — ' if is_folder else ''}File {idx}/{total_files}**\n"
+            f"📄 `{fname}`"
         )
         ok = await upload_file(client, message, fpath, idx, total_files, status_msg)
         if ok:
@@ -333,11 +392,12 @@ async def quota_retry_loop(
         quote=True,
     )
     try:
-        await process_one_link(client, message, url, retry_msg)
-        try:
-            await retry_msg.delete()
-        except Exception:
-            pass
+        ok = await process_one_link(client, message, url, retry_msg)
+        if ok:
+            try:
+                await retry_msg.delete()
+            except Exception:
+                pass
     except QuotaExceededError:
         await quota_retry_loop(client, message, url, retry_msg, attempt + 1, max_attempts)
 
@@ -347,15 +407,12 @@ async def quota_retry_loop(
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def user_worker(client: Client, user_id: int):
-    """Processes all queued links for a user one by one."""
     queue = user_queues[user_id]
 
     while True:
         try:
-            # Wait up to 30s for next item — then shut down worker
             url, message, status_msg = await asyncio.wait_for(queue.get(), timeout=30)
         except asyncio.TimeoutError:
-            # Queue empty for 30s — stop worker
             user_workers.pop(user_id, None)
             user_queues.pop(user_id, None)
             break
@@ -389,35 +446,33 @@ async def handle(client: Client, message: Message):
     if not mega_links:
         return await message.reply(
             "❌ No valid MEGA links found.\n"
-            "Supported: `https://mega.nz/file/XXXX#YYYY`",
+            "Supported:\n"
+            "• `https://mega.nz/file/XXXX#YYYY`\n"
+            "• `https://mega.nz/folder/XXXX#YYYY`",
             quote=True,
         )
 
     # Deduplicate preserving order
-    seen = set()
-    unique_links = []
+    seen, unique_links = set(), []
     for link in mega_links:
         if link not in seen:
             seen.add(link)
             unique_links.append(link)
 
     user_id = message.chat.id
-
-    # Create queue for this user if not exists
     if user_id not in user_queues:
         user_queues[user_id] = asyncio.Queue()
 
     queue = user_queues[user_id]
 
-    # Add each link to queue with its own status message
     for url in unique_links:
+        label      = "📂 Folder" if is_folder_link(url) else "📄 File"
         status_msg = await message.reply(
-            f"⏳ **Queued**\n🔗 `{url}`",
+            f"⏳ **Queued** {label}\n🔗 `{url}`",
             quote=True,
         )
         await queue.put((url, message, status_msg))
 
-    # Start worker if not already running for this user
     if not user_workers.get(user_id):
         user_workers[user_id] = True
         asyncio.create_task(user_worker(client, user_id))
